@@ -307,16 +307,62 @@ is_effectively_set() {
     if [[ -z "$v" ]]; then
         return 1
     fi
+    # P0-4.3: reject clearly short strings (no real key is < 16 chars)
+    if (( ${#v} < 16 )); then
+        return 1
+    fi
     local lower
     lower=$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]')
+    # P0-4.3: extended placeholder patterns (no < > [ ] — invalid in case patterns)
     case "$lower" in
-        *your-*-api-key)
+        *your*api*key*|*your*key*here*|*api_key_here*|*enter*key*|\
+        *insert*key*|*add*key*|*put*key*|*replace*key*|*sample*key*|\
+        *placeholder*|*api-key-here*)
             return 1
             ;;
         *)
             return 0
             ;;
     esac
+}
+
+# P0-4.3: Warn (non-fatal) when an API key does not match its provider's known format.
+# This catches copy-paste errors early without blocking legitimate but undocumented formats.
+validate_api_key_format() {
+    local provider="$1"
+    local key="$2"
+
+    [[ -z "$key" ]] && return 0
+
+    local fmt_ok=true
+    case "$provider" in
+        "anthropic"|"claude")
+            # Official Anthropic keys begin with sk-ant-
+            [[ "$key" =~ ^sk-ant- ]] || fmt_ok=false
+            ;;
+        "deepseek")
+            # DeepSeek keys: sk- followed by 32+ alphanumeric chars
+            [[ "$key" =~ ^sk-[a-zA-Z0-9]{32,}$ ]] || fmt_ok=false
+            ;;
+        "openrouter")
+            # OpenRouter keys: sk-or-v1-
+            [[ "$key" =~ ^sk-or-v1- ]] || fmt_ok=false
+            ;;
+        "kimi")
+            # Moonshot/Kimi keys start with sk-
+            [[ "$key" =~ ^sk- ]] || fmt_ok=false
+            ;;
+        # GLM, Qwen, MiniMax, ARK — formats not publicly documented; skip check
+        *)
+            return 0
+            ;;
+    esac
+
+    if ! $fmt_ok; then
+        echo -e "${YELLOW}⚠️  Warning: the $provider API key format looks unexpected.${NC}" >&2
+        echo -e "${YELLOW}   Authentication may fail — check the key in ~/.ccm_config${NC}" >&2
+    fi
+    return 0
 }
 
 # 安全掩码工具
@@ -720,35 +766,49 @@ user_write_settings() {
 
     # Use Python or jq to merge settings if available, otherwise use simple approach
     if command -v python3 >/dev/null 2>&1; then
-        python3 << PYTHON_EOF
+        # P0-4.4: pass all values via env vars — avoids shell interpolation inside Python
+        # which breaks tokens containing single quotes, backslashes, or newlines.
+        CCM_SETTINGS_PATH="$settings_path" \
+        CCM_PROVIDER="$provider" \
+        CCM_REGION="$region" \
+        CCM_BASE_URL="$config_base_url" \
+        CCM_MODEL="$config_model" \
+        CCM_TOKEN="${config_token:-}" \
+        python3 << 'PYTHON_EOF'
 import json
 import os
 
-settings_path = "$settings_path"
-existing = {}
+settings_path = os.environ['CCM_SETTINGS_PATH']
+provider     = os.environ['CCM_PROVIDER']
+region       = os.environ['CCM_REGION']
+base_url     = os.environ['CCM_BASE_URL']
+model        = os.environ['CCM_MODEL']
+token        = os.environ.get('CCM_TOKEN', '')
 
+existing = {}
 if os.path.exists(settings_path):
     try:
         with open(settings_path, 'r') as f:
             existing = json.load(f)
-    except:
+    except Exception:
         existing = {}
 
 # Preserve non-ccm settings but mark as ccm-managed
 existing['ccmManaged'] = True
-existing['ccmProvider'] = '$provider'
-existing['ccmRegion'] = '$region'
+existing['ccmProvider'] = provider
+existing['ccmRegion']   = region
 
 # Set env
 existing['env'] = {
-    'ANTHROPIC_BASE_URL': '$config_base_url',
-    'ANTHROPIC_MODEL': '$config_model',
-    'ANTHROPIC_DEFAULT_SONNET_MODEL': '$config_model',
-    'ANTHROPIC_DEFAULT_OPUS_MODEL': '$config_model',
-    'ANTHROPIC_DEFAULT_HAIKU_MODEL': '$config_model',
-    'CLAUDE_CODE_SUBAGENT_MODEL': '$config_model'
+    'ANTHROPIC_BASE_URL':               base_url,
+    'ANTHROPIC_MODEL':                  model,
+    'ANTHROPIC_DEFAULT_SONNET_MODEL':   model,
+    'ANTHROPIC_DEFAULT_OPUS_MODEL':     model,
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL':    model,
+    'CLAUDE_CODE_SUBAGENT_MODEL':       model,
 }
-$(if [[ -n "$config_token" ]]; then echo "existing['env']['ANTHROPIC_AUTH_TOKEN'] = '$config_token'"; fi)
+if token:
+    existing['env']['ANTHROPIC_AUTH_TOKEN'] = token
 
 with open(settings_path, 'w') as f:
     json.dump(existing, f, indent=2)
@@ -756,7 +816,12 @@ with open(settings_path, 'w') as f:
 os.chmod(settings_path, 0o600)
 PYTHON_EOF
     else
-        # Fallback: write minimal settings (will lose other settings)
+        # Fallback: write minimal settings (will lose other settings).
+        # JSON-escape the token for the heredoc: escape backslash then double-quote.
+        local escaped_token=""
+        if [[ -n "$config_token" ]]; then
+            escaped_token="$(printf '%s' "$config_token" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+        fi
         cat > "$settings_path" <<EOF
 {
   "ccmManaged": true,
@@ -768,8 +833,7 @@ PYTHON_EOF
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "$config_model",
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "$config_model",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "$config_model",
-    "CLAUDE_CODE_SUBAGENT_MODEL": "$config_model"$([[ -n "$config_token" ]] && echo ",
-    \"ANTHROPIC_AUTH_TOKEN\": \"$config_token\"")
+    "CLAUDE_CODE_SUBAGENT_MODEL": "$config_model"$([[ -n "$escaped_token" ]] && printf ',\n    "ANTHROPIC_AUTH_TOKEN": "%s"' "$escaped_token")
   }
 }
 EOF
@@ -802,11 +866,11 @@ user_reset_settings() {
 
     # Remove env section and ccm markers using Python or jq
     if command -v python3 >/dev/null 2>&1; then
-        python3 << PYTHON_EOF
+        CCM_SETTINGS_PATH="$settings_path" python3 << 'PYTHON_EOF'
 import json
 import os
 
-settings_path = "$settings_path"
+settings_path = os.environ['CCM_SETTINGS_PATH']
 
 with open(settings_path, 'r') as f:
     data = json.load(f)
@@ -904,7 +968,7 @@ read_linux_credentials() {
     else
         # 降级方案：使用 Python 或 grep（适用于简单情况）
         if command -v python3 >/dev/null 2>&1; then
-            credentials=$(python3 -c "import json; f=open('$CLAUDE_CREDENTIALS_FILE'); d=json.load(f); print(json.dumps(d.get('claudeAiOauth', {})))" 2>/dev/null)
+            credentials=$(CCM_CREDS_FILE="$CLAUDE_CREDENTIALS_FILE" python3 -c "import json,os; d=json.load(open(os.environ['CCM_CREDS_FILE'])); print(json.dumps(d.get('claudeAiOauth', {})))" 2>/dev/null)
         else
             # 最后降级：简单的 grep（可能不完整）
             credentials=$(cat "$CLAUDE_CREDENTIALS_FILE" | grep -o '"claudeAiOauth":{[^}]*}' | sed 's/"claudeAiOauth"://')
@@ -984,7 +1048,7 @@ write_linux_credentials() {
             existing_content=$(cat "$CLAUDE_CREDENTIALS_FILE")
             # 提取 mcpOAuth 部分（如果存在）- 更好的正则表达式
             if command -v python3 >/dev/null 2>&1; then
-                mcp_oauth=$(python3 -c "import json; f=open('$CLAUDE_CREDENTIALS_FILE'); d=json.load(f); print(json.dumps(d.get('mcpOAuth', {})) if d.get('mcpOAuth') else '')" 2>/dev/null)
+                mcp_oauth=$(CCM_CREDS_FILE="$CLAUDE_CREDENTIALS_FILE" python3 -c "import json,os; d=json.load(open(os.environ['CCM_CREDS_FILE'])); print(json.dumps(d.get('mcpOAuth', {})) if d.get('mcpOAuth') else '')" 2>/dev/null)
             fi
         fi
 
@@ -1265,9 +1329,9 @@ list_accounts() {
             echo -e "   - ${YELLOW}$name${NC} (${subscription:-Unknown}${expires_str:+, expires: $expires_str})$is_current"
         done
     elif command -v python3 >/dev/null 2>&1; then
-        python3 -c "
-import json
-with open('$ACCOUNTS_FILE') as f:
+        CCM_ACCOUNTS_FILE="$ACCOUNTS_FILE" python3 -c "
+import json, os
+with open(os.environ['CCM_ACCOUNTS_FILE']) as f:
     data = json.load(f)
     for name, encoded in data.items():
         print(f'{name}|{encoded}')
@@ -1793,6 +1857,13 @@ show_help() {
     echo "  current-account         - Show current account info"
     echo "  claude:account         - Switch account and use Claude (Sonnet)"
     echo ""
+    echo -e "${YELLOW}Keystore — Encrypted API key storage (WSL/Windows):${NC}"
+    echo "  keystore set <KEY_VAR>  - Store key encrypted with Windows DPAPI"
+    echo "  keystore show <KEY_VAR> - Show stored key (masked)"
+    echo "  keystore list           - List all stored key names"
+    echo "  keystore delete <KEY>   - Remove a stored key"
+    echo "  (run 'ccm keystore' for full help and workflow)"
+    echo ""
     echo -e "${YELLOW}$(t 'tool_options'):${NC}"
     echo "  status, st       - $(t 'show_current_config')"
     echo "  env [model]      - $(t 'output_export_only')"
@@ -1947,6 +2018,207 @@ update_config() {
     fi
 }
 
+# ============================================
+# Windows Credential Store (WSL — DPAPI)
+# ============================================
+
+# True (return 0) when running inside WSL.
+detect_wsl() {
+    [[ -f /proc/version ]] && grep -qiE "microsoft|wsl" /proc/version 2>/dev/null
+}
+
+# Write an API key to %APPDATA%\ccm\credentials\ encrypted with Windows DPAPI.
+# The value is passed via an environment variable to avoid PowerShell injection.
+write_windows_credential() {
+    local var_name="$1"
+    local key_value="$2"
+    CCM_WINCRED_NAME="$var_name" CCM_WINCRED_VALUE="$key_value" \
+    powershell.exe -NoProfile -NonInteractive -Command '
+        $dir  = Join-Path $env:APPDATA "ccm\credentials"
+        $null = New-Item -ItemType Directory -Path $dir -Force
+        $sec  = ConvertTo-SecureString $env:CCM_WINCRED_VALUE -AsPlainText -Force
+        $cred = New-Object PSCredential($env:CCM_WINCRED_NAME, $sec)
+        $file = Join-Path $dir ($env:CCM_WINCRED_NAME + ".xml")
+        $cred | Export-Clixml -Path $file -Force
+    ' 2>/dev/null
+}
+
+# Read a DPAPI-encrypted key. Outputs the plaintext value or nothing.
+read_windows_credential() {
+    local var_name="$1"
+    CCM_WINCRED_NAME="$var_name" \
+    powershell.exe -NoProfile -NonInteractive -Command '
+        $file = Join-Path $env:APPDATA "ccm\credentials\$($env:CCM_WINCRED_NAME).xml"
+        if (Test-Path $file) {
+            $cred = Import-Clixml -Path $file
+            $cred.GetNetworkCredential().Password
+        }
+    ' 2>/dev/null
+}
+
+# Delete a stored key. Returns 0 if deleted, 1 if not found.
+delete_windows_credential() {
+    local var_name="$1"
+    CCM_WINCRED_NAME="$var_name" \
+    powershell.exe -NoProfile -NonInteractive -Command '
+        $file = Join-Path $env:APPDATA "ccm\credentials\$($env:CCM_WINCRED_NAME).xml"
+        if (Test-Path $file) { Remove-Item $file -Force; exit 0 } else { exit 1 }
+    ' 2>/dev/null
+    return $?
+}
+
+# List the names of all stored keys (one per line).
+list_windows_credentials() {
+    powershell.exe -NoProfile -NonInteractive -Command '
+        $dir = Join-Path $env:APPDATA "ccm\credentials"
+        if (Test-Path $dir) {
+            Get-ChildItem -Path $dir -Filter "*.xml" |
+                Select-Object -ExpandProperty BaseName
+        }
+    ' 2>/dev/null
+}
+
+# Resolve an API key: config file first, Windows keystore second (WSL only).
+# Echoes the value to stdout. Returns 0 if found, 1 if not found.
+# Side-effect: sets _CCM_KEY_SOURCE to "config" or "keystore".
+_resolve_api_key() {
+    local var_name="$1"
+    local val="${!var_name:-}"
+    _CCM_KEY_SOURCE="config"
+
+    if is_effectively_set "$val"; then
+        echo "$val"
+        return 0
+    fi
+
+    if detect_wsl; then
+        local ks_val
+        ks_val="$(read_windows_credential "$var_name" 2>/dev/null)"
+        if is_effectively_set "$ks_val"; then
+            _CCM_KEY_SOURCE="keystore"
+            echo "$ks_val"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# Emit the ANTHROPIC_AUTH_TOKEN export line.
+# From keystore: embed the literal value (goes via eval — not logged).
+# From config:   keep the ${VAR} reference (existing behaviour, no change).
+_emit_auth_token() {
+    local key_val="$1"
+    local var_name="$2"
+    if [[ "${_CCM_KEY_SOURCE:-config}" == "keystore" ]]; then
+        printf 'export ANTHROPIC_AUTH_TOKEN=%s\n' "$(printf '%q' "$key_val")"
+    else
+        echo "export ANTHROPIC_AUTH_TOKEN=\"\${${var_name}}\""
+    fi
+}
+
+# ============================================
+# ccm keystore command
+# ============================================
+
+keystore_set() {
+    local var_name="${1:-}"
+    if [[ -z "$var_name" ]]; then
+        echo -e "${RED}❌ Usage: ccm keystore set <KEY_VAR>${NC}" >&2
+        echo -e "${YELLOW}   Example: ccm keystore set DEEPSEEK_API_KEY${NC}" >&2
+        return 1
+    fi
+    if ! [[ "$var_name" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+        echo -e "${RED}❌ Invalid variable name: $var_name${NC}" >&2
+        return 1
+    fi
+
+    local key_value
+    read -rs -p "Enter value for $var_name: " key_value </dev/tty
+    echo "" >&2
+
+    if ! is_effectively_set "$key_value"; then
+        echo -e "${RED}❌ Value is empty or looks like a placeholder.${NC}" >&2
+        return 1
+    fi
+
+    if write_windows_credential "$var_name" "$key_value"; then
+        echo -e "${GREEN}✅ $var_name stored (DPAPI-encrypted in %%APPDATA%%\\ccm\\credentials\\)${NC}" >&2
+        echo -e "${YELLOW}💡 You can now remove $var_name from ~/.ccm_config — keystore is the fallback.${NC}" >&2
+    else
+        echo -e "${RED}❌ Failed to write to Windows Credential Manager. Is powershell.exe accessible?${NC}" >&2
+        return 1
+    fi
+}
+
+keystore_list() {
+    local names
+    names="$(list_windows_credentials 2>/dev/null)"
+    if [[ -z "$names" ]]; then
+        echo -e "${YELLOW}ℹ️  No keys stored in keystore yet.${NC}" >&2
+        echo -e "${YELLOW}   Run: ccm keystore set DEEPSEEK_API_KEY${NC}" >&2
+        return 0
+    fi
+    echo -e "${BLUE}🔐 Stored keys (DPAPI-encrypted in %%APPDATA%%\\ccm\\credentials\\):${NC}" >&2
+    while IFS= read -r name; do
+        [[ -n "$name" ]] && echo -e "   ${YELLOW}${name}${NC}" >&2
+    done <<< "$names"
+}
+
+keystore_show() {
+    local var_name="${1:-}"
+    if [[ -z "$var_name" ]]; then
+        echo -e "${RED}❌ Usage: ccm keystore show <KEY_VAR>${NC}" >&2
+        return 1
+    fi
+    local val
+    val="$(read_windows_credential "$var_name" 2>/dev/null)"
+    if is_effectively_set "$val"; then
+        echo -e "${BLUE}$var_name:${NC} $(mask_token "$val")" >&2
+    else
+        echo -e "${YELLOW}⚠️  $var_name not found in keystore.${NC}" >&2
+        return 1
+    fi
+}
+
+keystore_delete() {
+    local var_name="${1:-}"
+    if [[ -z "$var_name" ]]; then
+        echo -e "${RED}❌ Usage: ccm keystore delete <KEY_VAR>${NC}" >&2
+        return 1
+    fi
+    if delete_windows_credential "$var_name"; then
+        echo -e "${GREEN}✅ $var_name removed from keystore.${NC}" >&2
+    else
+        echo -e "${YELLOW}⚠️  $var_name was not found in keystore.${NC}" >&2
+    fi
+}
+
+keystore_show_usage() {
+    echo -e "${BLUE}🔐 CCM Keystore — Windows DPAPI Credential Storage (WSL)${NC}" >&2
+    echo "" >&2
+    echo "Stores API keys encrypted with Windows DPAPI." >&2
+    echo "Encrypted files live in: %APPDATA%\\ccm\\credentials\\" >&2
+    echo "Keys are bound to your Windows user account + machine." >&2
+    echo "Even a copy of the file is unreadable on another machine." >&2
+    echo "" >&2
+    echo -e "${YELLOW}Usage:${NC}" >&2
+    echo "  ccm keystore set <KEY_VAR>    - Store a key (prompts, never echoed)" >&2
+    echo "  ccm keystore show <KEY_VAR>   - Show masked value" >&2
+    echo "  ccm keystore list             - List all stored key names" >&2
+    echo "  ccm keystore delete <KEY_VAR> - Remove a key" >&2
+    echo "" >&2
+    echo -e "${YELLOW}Supported KEY_VAR names:${NC}" >&2
+    echo "  DEEPSEEK_API_KEY  KIMI_API_KEY  GLM_API_KEY  QWEN_API_KEY" >&2
+    echo "  MINIMAX_API_KEY   ARK_API_KEY   STEPFUN_API_KEY" >&2
+    echo "  CLAUDE_API_KEY    OPENROUTER_API_KEY" >&2
+    echo "" >&2
+    echo -e "${YELLOW}Workflow:${NC}" >&2
+    echo "  1. ccm keystore set DEEPSEEK_API_KEY   # stores encrypted" >&2
+    echo "  2. Remove the key from ~/.ccm_config   # no more plaintext" >&2
+    echo "  3. eval \"\$(ccm deepseek)\"               # reads from keystore automatically" >&2
+}
+
 # 仅输出 export 语句的环境设置（用于 eval）
 show_open_help() {
     echo -e "${YELLOW}OpenRouter:${NC}"
@@ -1969,10 +2241,13 @@ emit_openrouter_exports() {
     # 加载配置以便进行存在性判断（环境变量优先，不打印密钥）
     load_config || return 1
 
-    if ! is_effectively_set "$OPENROUTER_API_KEY"; then
+    local or_key
+    if ! or_key="$(_resolve_api_key "OPENROUTER_API_KEY")"; then
         echo -e "${RED}❌ Please configure OPENROUTER_API_KEY${NC}" >&2
+        detect_wsl && echo -e "${YELLOW}💡 Or store it encrypted: ccm keystore set OPENROUTER_API_KEY${NC}" >&2
         return 1
     fi
+    validate_api_key_format "openrouter" "$or_key"
     if [[ -z "$provider" ]]; then
         show_open_help >&2
         return 1
@@ -2053,7 +2328,7 @@ emit_openrouter_exports() {
     echo "export ANTHROPIC_BASE_URL='https://openrouter.ai/api'"
     echo "export ANTHROPIC_API_URL='https://openrouter.ai/api'"
     echo "if [ -f \"\$HOME/.ccm_config\" ]; then . \"\$HOME/.ccm_config\" >/dev/null 2>&1; fi"
-    echo "export ANTHROPIC_AUTH_TOKEN=\"\${OPENROUTER_API_KEY}\""
+    _emit_auth_token "$or_key" "OPENROUTER_API_KEY"
     echo "export ANTHROPIC_API_KEY=''"
     echo "export ANTHROPIC_MODEL='${model}'"
     echo "export ANTHROPIC_SMALL_FAST_MODEL='${small}'"
@@ -2070,30 +2345,37 @@ emit_env_exports() {
     # 通用前导：清理旧变量
     local prelude="unset ANTHROPIC_BASE_URL ANTHROPIC_API_URL ANTHROPIC_AUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_MODEL ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL CLAUDE_CODE_SUBAGENT_MODEL API_TIMEOUT_MS CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
 
+    _missing_key_error() {
+        local var_name="$1"
+        echo -e "${RED}❌ Please configure ${var_name} in ~/.ccm_config${NC}" >&2
+        detect_wsl && echo -e "${YELLOW}💡 Or store it encrypted: ccm keystore set ${var_name}${NC}" >&2
+    }
+
     case "$target" in
         "open")
             emit_openrouter_exports "$arg"
             ;;
         "deepseek"|"ds")
-            if is_effectively_set "$DEEPSEEK_API_KEY"; then
-                echo "$prelude"
-                echo "export ANTHROPIC_BASE_URL='https://api.deepseek.com/anthropic'"
-                echo "if [ -f \"\$HOME/.ccm_config\" ]; then . \"\$HOME/.ccm_config\" >/dev/null 2>&1; fi"
-                echo "export ANTHROPIC_AUTH_TOKEN=\"\${DEEPSEEK_API_KEY}\""
-                local ds_model="${DEEPSEEK_MODEL:-deepseek-chat}"
-                echo "export ANTHROPIC_MODEL='${ds_model}'"
-                emit_default_models "deepseek/deepseek-v3.2" "deepseek/deepseek-v3.2" "deepseek/deepseek-v3.2"
-                emit_subagent_model "$ds_model"
-            else
-                echo -e "${RED}❌ Please configure DEEPSEEK_API_KEY${NC}" >&2
-                return 1
+            local ds_key
+            if ! ds_key="$(_resolve_api_key "DEEPSEEK_API_KEY")"; then
+                _missing_key_error "DEEPSEEK_API_KEY"; return 1
             fi
+            validate_api_key_format "deepseek" "$ds_key"
+            echo "$prelude"
+            echo "export ANTHROPIC_BASE_URL='https://api.deepseek.com/anthropic'"
+            echo "if [ -f \"\$HOME/.ccm_config\" ]; then . \"\$HOME/.ccm_config\" >/dev/null 2>&1; fi"
+            _emit_auth_token "$ds_key" "DEEPSEEK_API_KEY"
+            local ds_model="${DEEPSEEK_MODEL:-deepseek-chat}"
+            echo "export ANTHROPIC_MODEL='${ds_model}'"
+            emit_default_models "deepseek/deepseek-v3.2" "deepseek/deepseek-v3.2" "deepseek/deepseek-v3.2"
+            emit_subagent_model "$ds_model"
             ;;
         "kimi"|"kimi2"|"kimi-cn")
-            if ! is_effectively_set "$KIMI_API_KEY"; then
-                echo -e "${RED}❌ Please configure KIMI_API_KEY${NC}" >&2
-                return 1
+            local kimi_key
+            if ! kimi_key="$(_resolve_api_key "KIMI_API_KEY")"; then
+                _missing_key_error "KIMI_API_KEY"; return 1
             fi
+            validate_api_key_format "kimi" "$kimi_key"
             local region_input="$arg"
             if [[ "$target" == "kimi-cn" ]]; then
                 region_input="china"
@@ -2116,15 +2398,15 @@ emit_env_exports() {
             echo "$prelude"
             echo "export ANTHROPIC_BASE_URL='${kimi_base_url}'"
             echo "if [ -f \"\$HOME/.ccm_config\" ]; then . \"\$HOME/.ccm_config\" >/dev/null 2>&1; fi"
-            echo "export ANTHROPIC_AUTH_TOKEN=\"\${KIMI_API_KEY}\""
+            _emit_auth_token "$kimi_key" "KIMI_API_KEY"
             echo "export ANTHROPIC_MODEL='${kimi_model}'"
             emit_default_models "$kimi_model" "$kimi_model" "$kimi_model"
             emit_subagent_model "$kimi_model"
             ;;
         "qwen")
-            if ! is_effectively_set "$QWEN_API_KEY"; then
-                echo -e "${RED}❌ Please configure QWEN_API_KEY${NC}" >&2
-                return 1
+            local qwen_key
+            if ! qwen_key="$(_resolve_api_key "QWEN_API_KEY")"; then
+                _missing_key_error "QWEN_API_KEY"; return 1
             fi
             local qwen_region
             if ! qwen_region="$(normalize_region "$arg")"; then
@@ -2145,15 +2427,15 @@ emit_env_exports() {
             echo "$prelude"
             echo "export ANTHROPIC_BASE_URL='${qwen_base_url}'"
             echo "if [ -f \"\$HOME/.ccm_config\" ]; then . \"\$HOME/.ccm_config\" >/dev/null 2>&1; fi"
-            echo "export ANTHROPIC_AUTH_TOKEN=\"\${QWEN_API_KEY}\""
+            _emit_auth_token "$qwen_key" "QWEN_API_KEY"
             echo "export ANTHROPIC_MODEL='${qwen_model}'"
             emit_default_models "$qwen_model" "$qwen_model" "qwen3-coder-plus"
             emit_subagent_model "$qwen_model"
             ;;
         "glm"|"glm5")
-            if ! is_effectively_set "$GLM_API_KEY"; then
-                echo -e "${RED}❌ Please configure GLM_API_KEY${NC}" >&2
-                return 1
+            local glm_key
+            if ! glm_key="$(_resolve_api_key "GLM_API_KEY")"; then
+                _missing_key_error "GLM_API_KEY"; return 1
             fi
             local glm_region
             if ! glm_region="$(normalize_region "$arg")"; then
@@ -2174,15 +2456,15 @@ emit_env_exports() {
             echo "$prelude"
             echo "export ANTHROPIC_BASE_URL='${glm_base_url}'"
             echo "if [ -f \"\$HOME/.ccm_config\" ]; then . \"\$HOME/.ccm_config\" >/dev/null 2>&1; fi"
-            echo "export ANTHROPIC_AUTH_TOKEN=\"\${GLM_API_KEY}\""
+            _emit_auth_token "$glm_key" "GLM_API_KEY"
             echo "export ANTHROPIC_MODEL='${glm_model}'"
             emit_default_models "$glm_model" "$glm_model" "$glm_model"
             emit_subagent_model "$glm_model"
             ;;
         "minimax"|"mm")
-            if ! is_effectively_set "$MINIMAX_API_KEY"; then
-                echo -e "${RED}❌ Please configure MINIMAX_API_KEY${NC}" >&2
-                return 1
+            local mm_key
+            if ! mm_key="$(_resolve_api_key "MINIMAX_API_KEY")"; then
+                _missing_key_error "MINIMAX_API_KEY"; return 1
             fi
             local mm_region
             if ! mm_region="$(normalize_region "$arg")"; then
@@ -2203,15 +2485,15 @@ emit_env_exports() {
             echo "$prelude"
             echo "export ANTHROPIC_BASE_URL='${mm_base_url}'"
             echo "if [ -f \"\$HOME/.ccm_config\" ]; then . \"\$HOME/.ccm_config\" >/dev/null 2>&1; fi"
-            echo "export ANTHROPIC_AUTH_TOKEN=\"\${MINIMAX_API_KEY}\""
+            _emit_auth_token "$mm_key" "MINIMAX_API_KEY"
             echo "export ANTHROPIC_MODEL='${mm_model}'"
             emit_default_models "$mm_model" "$mm_model" "$mm_model"
             emit_subagent_model "$mm_model"
             ;;
         "seed"|"doubao")
-            if ! is_effectively_set "$ARK_API_KEY"; then
-                echo -e "${RED}❌ Please configure ARK_API_KEY${NC}" >&2
-                return 1
+            local ark_key
+            if ! ark_key="$(_resolve_api_key "ARK_API_KEY")"; then
+                _missing_key_error "ARK_API_KEY"; return 1
             fi
             local seed_variant="$arg"
             local seed_model=""
@@ -2240,20 +2522,20 @@ emit_env_exports() {
             echo "$prelude"
             echo "export ANTHROPIC_BASE_URL='https://ark.cn-beijing.volces.com/api/coding'"
             echo "if [ -f \"\$HOME/.ccm_config\" ]; then . \"\$HOME/.ccm_config\" >/dev/null 2>&1; fi"
-            echo "export ANTHROPIC_AUTH_TOKEN=\"\${ARK_API_KEY}\""
+            _emit_auth_token "$ark_key" "ARK_API_KEY"
             echo "export ANTHROPIC_MODEL='${seed_model}'"
             emit_default_models "$seed_model" "$seed_model" "$seed_model"
             emit_subagent_model "$seed_model"
             ;;
         "stepfun")
-            if ! is_effectively_set "$STEPFUN_API_KEY"; then
-                echo -e "${RED}❌ Please configure STEPFUN_API_KEY${NC}" >&2
-                return 1
+            local sf_key
+            if ! sf_key="$(_resolve_api_key "STEPFUN_API_KEY")"; then
+                _missing_key_error "STEPFUN_API_KEY"; return 1
             fi
             echo "$prelude"
             echo "export ANTHROPIC_BASE_URL='https://api.stepfun.ai/v1/anthropic'"
             echo "if [ -f \"\$HOME/.ccm_config\" ]; then . \"\$HOME/.ccm_config\" >/dev/null 2>&1; fi"
-            echo "export ANTHROPIC_AUTH_TOKEN=\"\${STEPFUN_API_KEY}\""
+            _emit_auth_token "$sf_key" "STEPFUN_API_KEY"
             local stepfun_model="${STEPFUN_MODEL:-step-3.5-flash}"
             echo "export ANTHROPIC_MODEL='${stepfun_model}'"
             emit_default_models "$stepfun_model" "$stepfun_model" "$stepfun_model"
@@ -2270,8 +2552,10 @@ emit_env_exports() {
             local default_opus="${OPUS_MODEL:-claude-opus-4-6}"
             local default_haiku="${HAIKU_MODEL:-claude-haiku-4-5-20251001}"
             echo "export ANTHROPIC_MODEL='${claude_model}'"
-            if is_effectively_set "$CLAUDE_API_KEY"; then
-                echo "export ANTHROPIC_AUTH_TOKEN=\"\${CLAUDE_API_KEY}\""
+            local claude_key
+            if claude_key="$(_resolve_api_key "CLAUDE_API_KEY")"; then
+                validate_api_key_format "anthropic" "$claude_key"
+                _emit_auth_token "$claude_key" "CLAUDE_API_KEY"
             fi
             emit_default_models "$default_sonnet" "$default_opus" "$default_haiku"
             emit_subagent_model "$claude_model"
@@ -2405,6 +2689,27 @@ main() {
                 *)
                     echo -e "${RED}❌ $(t 'unknown_option'): user $user_action${NC}" >&2
                     user_show_usage
+                    return 1
+                    ;;
+            esac
+            ;;
+        "keystore"|"ks")
+            shift
+            local ks_action="${1:-}"
+            if ! detect_wsl; then
+                echo -e "${RED}❌ ccm keystore is only available in WSL (Windows).${NC}" >&2
+                echo -e "${YELLOW}   On macOS, credentials are stored in Keychain automatically.${NC}" >&2
+                return 1
+            fi
+            case "$ks_action" in
+                "set")              keystore_set "${2:-}" ;;
+                "show")             keystore_show "${2:-}" ;;
+                "list")             keystore_list ;;
+                "delete"|"del"|"rm") keystore_delete "${2:-}" ;;
+                ""|"help"|"-h"|"--help") keystore_show_usage ;;
+                *)
+                    echo -e "${RED}❌ Unknown keystore action: $ks_action${NC}" >&2
+                    keystore_show_usage
                     return 1
                     ;;
             esac
